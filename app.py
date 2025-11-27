@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import requests
 import json
@@ -36,6 +36,9 @@ pending_requests = {}
 pending_lock = threading.Lock()
 current_sensor_data = {"temperature": 0, "humidity": 0, "light": 0}
 esp8266_commands = {}
+
+# Store active alarms
+active_alarms = {}
 
 # Smart scanning control
 last_sensor_scan = 0
@@ -526,6 +529,157 @@ def extract_activity_context(user_message):
     print(f"🔍 ACTIVITY: No specific activity detected, using 'general'")
     return 'general'
 
+# Enhanced Alarm Functions with Time Parsing
+def parse_alarm_time(user_message):
+    """Parse alarm time from user message - supports minutes and specific times"""
+    print(f"⏰ PARSING ALARM TIME from: '{user_message}'")
+    
+    user_lower = user_message.lower()
+    
+    # Extract minutes (e.g., "10 minutes", "after 5 mins")
+    minute_match = re.search(r'(\d+)\s*(?:min|minute|mins|minutes)', user_lower)
+    if minute_match:
+        minutes = int(minute_match.group(1))
+        print(f"⏰ FOUND MINUTES: {minutes} minutes")
+        return minutes * 60  # Convert to seconds
+    
+    # Extract hours (e.g., "2 hours", "after 1 hour")
+    hour_match = re.search(r'(\d+)\s*(?:hr|hour|hrs|hours)', user_lower)
+    if hour_match:
+        hours = int(hour_match.group(1))
+        print(f"⏰ FOUND HOURS: {hours} hours")
+        return hours * 3600  # Convert to seconds
+    
+    # Extract specific time (e.g., "3:30", "at 3:30", "15:30")
+    time_match = re.search(r'(?:at|by|for)\s+(\d{1,2}:\d{2})', user_lower)
+    if not time_match:
+        time_match = re.search(r'(\d{1,2}:\d{2})', user_lower)
+    
+    if time_match:
+        time_str = time_match.group(1)
+        print(f"⏰ FOUND SPECIFIC TIME: {time_str}")
+        
+        try:
+            # Parse the time
+            alarm_time = datetime.strptime(time_str, "%H:%M").time()
+            now = datetime.now()
+            
+            # Create datetime for today with the alarm time
+            alarm_datetime = datetime.combine(now.date(), alarm_time)
+            
+            # If the time has already passed today, set for tomorrow
+            if alarm_datetime < now:
+                alarm_datetime += timedelta(days=1)
+            
+            # Calculate seconds until alarm
+            seconds_until_alarm = (alarm_datetime - now).total_seconds()
+            
+            if seconds_until_alarm > 0:
+                print(f"⏰ ALARM SET FOR: {alarm_datetime} ({seconds_until_alarm:.0f} seconds from now)")
+                return seconds_until_alarm
+            else:
+                print("⏰ INVALID TIME: Alarm time is in the past")
+                return None
+                
+        except ValueError as e:
+            print(f"⏰ TIME PARSING ERROR: {e}")
+            return None
+    
+    # Extract simple numbers (e.g., "alarm 10" - assume minutes)
+    simple_match = re.search(r'alarm\s+(\d+)', user_lower)
+    if simple_match:
+        minutes = int(simple_match.group(1))
+        print(f"⏰ FOUND SIMPLE MINUTES: {minutes} minutes")
+        return minutes * 60
+    
+    # Default: 1 minute if no time specified but alarm mentioned
+    if 'alarm' in user_lower:
+        print("⏰ DEFAULT: 1 minute alarm")
+        return 60
+    
+    print("⏰ NO ALARM TIME FOUND")
+    return None
+
+def set_alarm(duration_seconds, alarm_type='standard', description=None):
+    """Set alarm with duration in seconds"""
+    print(f"🚨 SETTING ALARM: Duration={duration_seconds}s, Type={alarm_type}")
+    
+    # Store the alarm command immediately
+    esp8266_commands['alarm'] = True
+    esp8266_commands['alarm_duration'] = duration_seconds
+    esp8266_commands['alarm_type'] = alarm_type
+    
+    # Create a thread to handle the alarm timing
+    alarm_thread = threading.Thread(
+        target=execute_alarm_after_delay,
+        args=(duration_seconds, alarm_type, description)
+    )
+    alarm_thread.daemon = True
+    alarm_thread.start()
+    
+    # Format human-readable time
+    if duration_seconds >= 3600:
+        hours = duration_seconds // 3600
+        minutes = (duration_seconds % 3600) // 60
+        time_str = f"{hours}h {minutes}m"
+    elif duration_seconds >= 60:
+        minutes = duration_seconds // 60
+        time_str = f"{minutes} minutes"
+    else:
+        time_str = f"{duration_seconds} seconds"
+    
+    message = f"Alarm set for {time_str} ({alarm_type})"
+    if description:
+        message += f" - {description}"
+    
+    return message
+
+def execute_alarm_after_delay(delay_seconds, alarm_type, description=None):
+    """Execute alarm after specified delay"""
+    alarm_id = f"alarm_{int(time.time())}"
+    active_alarms[alarm_id] = {
+        'scheduled_time': time.time() + delay_seconds,
+        'type': alarm_type,
+        'description': description,
+        'active': True
+    }
+    
+    print(f"⏰ ALARM SCHEDULED: {alarm_id} in {delay_seconds} seconds")
+    
+    # Wait for the specified time
+    time.sleep(delay_seconds)
+    
+    # Check if alarm is still active (not cancelled)
+    if alarm_id in active_alarms and active_alarms[alarm_id]['active']:
+        print(f"🔊 ALARM TRIGGERED: {alarm_id}")
+        
+        # Set buzzer to beep
+        esp8266_commands['buzzer_action'] = 'beep'
+        esp8266_commands['buzzer_duration'] = 30  # Beep for 30 seconds
+        
+        # Remove from active alarms after triggering
+        del active_alarms[alarm_id]
+        
+        # Log the alarm trigger
+        print(f"🔊 BUZZER ACTIVATED: {alarm_type} alarm")
+    else:
+        print(f"⏹️ ALARM CANCELLED: {alarm_id}")
+
+def stop_alarm():
+    """Stop all active alarms and current buzzing"""
+    print("🛑 STOPPING ALARM")
+    
+    # Cancel all active alarms
+    for alarm_id in list(active_alarms.keys()):
+        active_alarms[alarm_id]['active'] = False
+        del active_alarms[alarm_id]
+    
+    # Stop current buzzer
+    esp8266_commands['buzzer_action'] = 'stop'
+    esp8266_commands['alarm'] = False
+    
+    return "All alarms stopped and buzzer turned off"
+
 # Device Control Functions
 def control_rgb_color(color):
     """Control RGB LED color"""
@@ -547,19 +701,30 @@ def control_buzzer(duration=None, action=None):
     else:
         return "No buzzer action specified"
 
-def set_alarm(duration, alarm_type='standard'):
-    """Set alarm with duration and type"""
-    print(f"🚨 SETTING ALARM: Duration={duration}s, Type={alarm_type}")
-    esp8266_commands['alarm'] = True
-    esp8266_commands['alarm_duration'] = duration
-    esp8266_commands['alarm_type'] = alarm_type
-    return f"Alarm set for {duration} seconds ({alarm_type})"
-
 def set_oled_display(text):
     """Set OLED display text"""
     print(f"📟 SETTING OLED: {text}")
     esp8266_commands['oled_text'] = text
     return f"OLED display set to: {text}"
+
+def interpret_light_level(ldr_value):
+    """Interpret LDR value - higher value means darker room"""
+    print(f"💡 INTERPRETING LIGHT: LDR value = {ldr_value}")
+    
+    if ldr_value is None or ldr_value == 0:
+        return "Unknown"
+    
+    # LDR interpretation (higher value = darker)
+    if ldr_value < 300:
+        return "Very Bright"
+    elif ldr_value < 1500:
+        return "Bright"
+    elif ldr_value < 1800:
+        return "Moderate"
+    elif ldr_value < 2000:
+        return "Dim"
+    else:
+        return "Very Dark"
 
 def parse_device_commands(llm_response, user_message):
     """Parse device commands from LLM response and user message"""
@@ -567,6 +732,35 @@ def parse_device_commands(llm_response, user_message):
     
     commands = []
     combined_text = f"{user_message} {llm_response}".lower()
+    
+    # Parse alarm commands with advanced time parsing
+    if 'alarm' in combined_text:
+        duration_seconds = parse_alarm_time(combined_text)
+        
+        if duration_seconds:
+            alarm_type = 'standard'
+            if 'urgent' in combined_text or 'emergency' in combined_text:
+                alarm_type = 'urgent'
+            elif 'reminder' in combined_text:
+                alarm_type = 'reminder'
+            elif 'wake' in combined_text or 'morning' in combined_text:
+                alarm_type = 'wakeup'
+            
+            # Create description
+            if duration_seconds >= 3600:
+                hours = duration_seconds // 3600
+                minutes = (duration_seconds % 3600) // 60
+                description = f"{hours}h {minutes}m timer"
+            elif duration_seconds >= 60:
+                minutes = duration_seconds // 60
+                description = f"{minutes} minute timer"
+            else:
+                description = f"{duration_seconds} second timer"
+            
+            commands.append(set_alarm(duration_seconds, alarm_type, description))
+        else:
+            # If alarm mentioned but no time parsed, set default 1 minute
+            commands.append(set_alarm(60, 'standard', '1 minute timer'))
     
     # Parse RGB color commands
     if any(color in combined_text for color in ['red', 'blue', 'green', 'yellow', 'purple', 'cyan', 'white']):
@@ -585,25 +779,12 @@ def parse_device_commands(llm_response, user_message):
         elif 'white' in combined_text:
             commands.append(control_rgb_color('white'))
     
-    # Parse buzzer commands
-    if 'buzzer' in combined_text or 'beep' in combined_text:
+    # Parse buzzer commands (immediate beep)
+    if ('buzzer' in combined_text or 'beep' in combined_text) and 'alarm' not in combined_text:
         # Extract duration if mentioned
         duration_match = re.search(r'(\d+)\s*sec', combined_text)
         duration = int(duration_match.group(1)) if duration_match else 2
         commands.append(control_buzzer(duration=duration))
-    
-    # Parse alarm commands
-    if 'alarm' in combined_text:
-        duration_match = re.search(r'(\d+)\s*sec', combined_text)
-        duration = int(duration_match.group(1)) if duration_match else 10
-        
-        alarm_type = 'standard'
-        if 'urgent' in combined_text or 'emergency' in combined_text:
-            alarm_type = 'urgent'
-        elif 'reminder' in combined_text:
-            alarm_type = 'reminder'
-            
-        commands.append(set_alarm(duration, alarm_type))
     
     # Parse OLED display commands
     if any(word in combined_text for word in ['display', 'show', 'oled', 'screen']):
@@ -796,10 +977,13 @@ def handle_info_request(user_message, session_id, classification):
         print("🎮 STEP 4: Parsing device commands")
         device_commands = parse_device_commands(llm_response, user_message)
         
+        # Format the bot response with better styling
+        formatted_response = format_bot_response(llm_response)
+        
         # Combine LLM response with device commands
-        final_response = llm_response
+        final_response = formatted_response
         if device_commands:
-            final_response += "\n\n" + "🔧 Device Actions:\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
+            final_response += "\n\n" + "🔧 <strong>DEVICE ACTIONS:</strong>\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
 
         # Step 5: Store assistant response in DB
         print("💾 STEP 5: Storing assistant response in database")
@@ -827,6 +1011,42 @@ def handle_info_request(user_message, session_id, classification):
     except Exception as e:
         print(f"❌ INFO REQUEST ERROR: {e}")
         return jsonify({"error": str(e), "status": "error"}), 500
+
+def format_bot_response(response_text):
+    """Format bot response with better styling and structure"""
+    print("🎨 FORMATTING BOT RESPONSE")
+    
+    # Split into lines and format
+    lines = response_text.split('\n')
+    formatted_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Format headings
+        if line.upper() == line and len(line) < 50 and ':' not in line:
+            formatted_lines.append(f"<strong>🎯 {line}</strong>")
+        # Format recommendations
+        elif line.startswith('-') or line.startswith('•') or line.startswith('*'):
+            formatted_lines.append(f"✅ {line}")
+        # Format important points
+        elif any(keyword in line.lower() for keyword in ['recommend', 'suggest', 'advise', 'should', 'better']):
+            formatted_lines.append(f"💡 {line}")
+        # Format warnings
+        elif any(keyword in line.lower() for keyword in ['warning', 'caution', 'avoid', 'too high', 'too low']):
+            formatted_lines.append(f"⚠️ {line}")
+        # Format sensor data
+        elif any(keyword in line.lower() for keyword in ['temperature', 'humidity', 'light', 'sensor']):
+            formatted_lines.append(f"🌡️ {line}")
+        # Format alarms
+        elif any(keyword in line.lower() for keyword in ['alarm', 'timer', 'reminder']):
+            formatted_lines.append(f"⏰ {line}")
+        else:
+            formatted_lines.append(line)
+    
+    return '\n'.join(formatted_lines)
 
 @app.route('/provide_sensor_data/<request_id>', methods=['POST'])
 def provide_sensor_data(request_id):
@@ -860,8 +1080,10 @@ def provide_sensor_data(request_id):
                 request_id=request_id
             )
             
-            # Build optimization prompt
+            # Build optimization prompt with LDR interpretation
             activity_context = extract_activity_context(request_info["user_message"])
+            light_interpretation = interpret_light_level(sensor_data.get('light'))
+            
             optimization_prompt = f"""
 You are a smart environment assistant that analyzes current room conditions and optimizes them for different activities.
 
@@ -871,7 +1093,8 @@ ACTIVITY CONTEXT: {activity_context}
 CURRENT SENSOR READINGS:
 - Temperature: {sensor_data.get('temperature', 'N/A')}°C
 - Humidity: {sensor_data.get('humidity', 'N/A')}%
-- Light Level: {sensor_data.get('light', 'N/A')}
+- Light Level: {sensor_data.get('light', 'N/A')} LDR (Higher = Darker)
+- Light Interpretation: {light_interpretation}
 
 Please analyze the current conditions and provide optimization recommendations. Focus on:
 1. What's problematic about current conditions for this activity
@@ -885,14 +1108,17 @@ Provide your response in a helpful, conversational tone with specific recommenda
             print("🧠 Generating optimization response with LLM1")
             llm_response = get_llm1_response(optimization_prompt)
             
+            # Format the bot response
+            formatted_response = format_bot_response(llm_response)
+            
             # Parse and execute device commands
             print("🎮 Parsing device commands for action request")
             device_commands = parse_device_commands(llm_response, request_info["user_message"])
             
             # Combine LLM response with device commands
-            final_response = llm_response
+            final_response = formatted_response
             if device_commands:
-                final_response += "\n\n" + "🔧 Device Actions:\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
+                final_response += "\n\n" + "🔧 <strong>DEVICE ACTIONS:</strong>\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
             
             # Parse and store environment changes
             print("💾 Storing environment changes")
@@ -1143,7 +1369,8 @@ def receive_sensor_data():
     
     if data:
         current_sensor_data.update(data)
-        print(f"📊 SENSOR DATA RECEIVED: Temp={data.get('temperature')}°C, Light={data.get('light')}")
+        light_interpretation = interpret_light_level(data.get('light'))
+        print(f"📊 SENSOR DATA RECEIVED: Temp={data.get('temperature')}°C, Light={data.get('light')} LDR ({light_interpretation})")
     
     return jsonify({"status": "success"})
 
@@ -1184,10 +1411,10 @@ def control_buzzer_web():
 def set_alarm_endpoint():
     """Set alarm with duration and type"""
     data = request.get_json()
-    duration = data.get('duration', 10)  # seconds
+    duration = data.get('duration', 1)  # minutes
     alarm_type = data.get('type', 'standard')  # standard, urgent, reminder
     
-    result = set_alarm(duration, alarm_type)
+    result = set_alarm(duration * 60, alarm_type)  # Convert minutes to seconds
     
     return jsonify({
         "status": "success", 
@@ -1195,12 +1422,10 @@ def set_alarm_endpoint():
     })
 
 @app.route('/stop_alarm', methods=['POST'])
-def stop_alarm():
+def stop_alarm_endpoint():
     """Stop the alarm"""
-    esp8266_commands['alarm'] = False
-    esp8266_commands['buzzer_action'] = 'stop'
-    
-    return jsonify({"status": "success", "message": "Alarm stopped"})
+    result = stop_alarm()
+    return jsonify({"status": "success", "message": result})
 
 @app.route('/set_oled', methods=['POST'])
 def set_oled():
@@ -1214,9 +1439,12 @@ def set_oled():
 @app.route('/current_sensor_data', methods=['GET'])
 def get_current_sensor_data():
     """Get current sensor data for dashboard"""
+    light_interpretation = interpret_light_level(current_sensor_data.get('light'))
+    
     return jsonify({
         "status": "success",
         "sensor_data": current_sensor_data,
+        "light_interpretation": light_interpretation,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -1255,6 +1483,7 @@ def health_check():
         "llm2_configured": bool(GEMINI_API_KEY),
         "scan_cooldown": SCAN_COOLDOWN,
         "can_scan_now": can_scan_now(),
+        "active_alarms": len(active_alarms),
         "timestamp": datetime.now().isoformat()
     })
 
@@ -1269,7 +1498,7 @@ def internal_error(error):
     """Handle 500 errors gracefully"""
     return jsonify({"error": "Internal server error", "status": "error"}), 500
 
-# Your exact frontend HTML code with fixed image URLs
+# Frontend HTML with enhanced alarm examples
 CHAT_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1327,7 +1556,6 @@ CHAT_HTML = """
             position: relative;
             z-index: 10; 
             pointer-events: none; 
-            /* Added padding to push text up slightly so it doesn't overlap game area too much */
             padding-bottom: 10px;
         }
 
@@ -1479,9 +1707,21 @@ CHAT_HTML = """
             max-width: 70%; padding: 15px; position: relative; font-size: 10px;
             box-shadow: -4px 0 0 0 black, 4px 0 0 0 black, 0 -4px 0 0 black, 0 4px 0 0 black;
             margin-bottom: 5px;
+            line-height: 1.6;
         }
         .user-bubble { background: #e70012; color: #fff; border: 4px solid #ffcccc; margin-right: 5px; }
-        .bot-bubble { background: #000; color: #fff; border: 4px solid #00aa00; margin-left: 5px; }
+        .bot-bubble { 
+            background: #000; 
+            color: #fff; 
+            border: 4px solid #00aa00; 
+            margin-left: 5px; 
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* Bot message formatting */
+        .bot-bubble strong { color: #ffff00; }
+        .bot-bubble .emoji { margin-right: 5px; }
 
         .system-header { color: #00ff00; text-align: center; margin-bottom: 10px; }
         .mission-list { color: #ffffff; line-height: 1.8; }
@@ -1490,7 +1730,17 @@ CHAT_HTML = """
         .chat-input { padding: 20px; background: #222; border-top: 4px solid #fff; position: relative; z-index: 20; }
         .input-group { display: flex; gap: 15px; }
         
-        #userInput { flex: 1; padding: 15px; background: #000; color: #fff; border: 4px solid #fff; outline: none; font-family: 'Press Start 2P', cursive; font-size: 10px; text-transform: uppercase; }
+        #userInput { 
+            flex: 1; 
+            padding: 15px; 
+            background: #000; 
+            color: #fff; 
+            border: 4px solid #fff; 
+            outline: none; 
+            font-family: 'Press Start 2P', cursive; 
+            font-size: 10px; 
+            text-transform: uppercase; 
+        }
         #userInput:focus { border-color: #00aa00; }
         
         /* SHARED BUTTON STYLES */
@@ -1566,6 +1816,15 @@ CHAT_HTML = """
             background: #00aa00;
         }
 
+        .alarm-examples {
+            margin-top: 15px;
+            padding: 10px;
+            background: #111;
+            border: 2px solid #333;
+            font-size: 9px;
+            color: #ccc;
+        }
+
         /* --- SENSOR DASHBOARD --- */
         .sensor-dashboard {
             background: #000;
@@ -1603,6 +1862,12 @@ CHAT_HTML = """
         .sensor-label {
             font-size: 9px;
             color: #ccc;
+        }
+
+        .light-interpretation {
+            font-size: 10px;
+            color: #00ff00;
+            margin-top: 5px;
         }
 
         /* --- RGB COLOR CONTROLS --- */
@@ -1683,7 +1948,8 @@ CHAT_HTML = """
                     </div>
                     <div class="sensor-item">
                         <div class="sensor-label">LIGHT LEVEL</div>
-                        <div class="sensor-value" id="lightValue">--</div>
+                        <div class="sensor-value" id="lightValue">-- LDR</div>
+                        <div class="light-interpretation" id="lightInterpretation">--</div>
                     </div>
                 </div>
             </div>
@@ -1706,10 +1972,18 @@ CHAT_HTML = """
             <div class="alarm-controls">
                 <h3>🚨 ALARM CONTROLS</h3>
                 <div class="alarm-buttons">
-                    <button class="alarm-btn" onclick="setAlarm(10, 'standard')">SET ALARM (10s)</button>
-                    <button class="alarm-btn" onclick="setAlarm(30, 'urgent')">URGENT ALARM (30s)</button>
+                    <button class="alarm-btn" onclick="setAlarm(1, 'standard')">SET ALARM (1min)</button>
+                    <button class="alarm-btn" onclick="setAlarm(5, 'urgent')">ALARM (5min)</button>
+                    <button class="alarm-btn" onclick="setAlarm(10, 'reminder')">ALARM (10min)</button>
                     <button class="alarm-btn stop" onclick="stopAlarm()">STOP ALARM</button>
                     <button class="alarm-btn" onclick="testBuzzer('beep')">TEST BEEP</button>
+                </div>
+                <div class="alarm-examples">
+                    <strong>VOICE EXAMPLES:</strong><br>
+                    "Set alarm after 10 minutes"<br>
+                    "Wake me up in 2 hours"<br>
+                    "Set alarm for 3:30"<br>
+                    "Reminder after 15 mins"
                 </div>
             </div>
 
@@ -1726,13 +2000,18 @@ CHAT_HTML = """
                     </div>
                     <br>
                     <div class="sensor-info">SENSORS: ONLINE [OK]</div>
+                    <br>
+                    <strong>⏰ ALARM EXAMPLES:</strong><br>
+                    • "Set alarm after 10 minutes"<br>
+                    • "Wake me up in 2 hours"<br>
+                    • "Set alarm for 3:30 PM"<br>
+                    • "Reminder after 15 mins"
                 </div>
             </div>
 
             <div class="message user-message">
-                <img src="https://i.ibb.co/9jSstgJ/mari.jpg" class="character-sprite" alt="Mario">
-                <div class="message-bubble user-bubble">
-                    I need to focus on coding late at night!
+                
+                <div>
                 </div>
             </div>
         </div>
@@ -1740,7 +2019,7 @@ CHAT_HTML = """
         <!-- INPUT AREA WITH NEW BUTTON -->
         <div class="chat-input">
             <div class="input-group">
-                <input type="text" id="userInput" placeholder="WHAT ARE WE DOING?" autocomplete="off">
+                <input type="text" id="userInput" placeholder="WHAT ARE WE DOING? (Space works here)" autocomplete="off">
                 
                 <!-- NEW VOICE BUTTON -->
                 <button id="voiceButton" title="Voice Input">🎤</button>
@@ -1840,21 +2119,43 @@ CHAT_HTML = """
             }
         }
 
+        // FIXED: Space bar only triggers game when not in input field
         document.addEventListener('keydown', function(e) {
-            if(["Space", "ArrowUp", "ArrowDown"].indexOf(e.code) > -1) {
-                e.preventDefault();
-            }
-            if ((e.key === " " || e.code === "Space" || e.key === "ArrowUp")) {
-                if (isGameOver) resetGame();
-                else jump();
-            }
-            if (e.key === "ArrowDown") {
-                duck(true);
+            const userInput = document.getElementById('userInput');
+            const isTyping = document.activeElement === userInput;
+            
+            if (isTyping) {
+                // Allow space in input field
+                if (e.key === " ") {
+                    // Let the space be typed normally
+                    return;
+                }
+                // Enter key sends message
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    sendMessage();
+                    return;
+                }
+            } else {
+                // Game controls when not typing
+                if(["Space", "ArrowUp", "ArrowDown"].indexOf(e.code) > -1) {
+                    e.preventDefault();
+                }
+                if ((e.key === " " || e.code === "Space" || e.key === "ArrowUp")) {
+                    if (isGameOver) resetGame();
+                    else jump();
+                }
+                if (e.key === "ArrowDown") {
+                    duck(true);
+                }
             }
         });
 
         document.addEventListener('keyup', function(e) {
-            if (e.key === "ArrowDown") {
+            const userInput = document.getElementById('userInput');
+            const isTyping = document.activeElement === userInput;
+            
+            if (!isTyping && e.key === "ArrowDown") {
                 duck(false);
             }
         });
@@ -1878,7 +2179,13 @@ CHAT_HTML = """
             
             const bubble = document.createElement('div');
             bubble.className = isUser ? 'message-bubble user-bubble' : 'message-bubble bot-bubble';
-            bubble.innerHTML = text;
+            
+            // Parse HTML for bot messages, plain text for user
+            if (isUser) {
+                bubble.textContent = text;
+            } else {
+                bubble.innerHTML = text;
+            }
             
             msgDiv.appendChild(img);
             msgDiv.appendChild(bubble);
@@ -1986,7 +2293,7 @@ CHAT_HTML = """
             // Stop Listening UI
             recognition.onend = () => {
                 voiceButton.classList.remove('listening');
-                userInput.placeholder = "WHAT ARE WE DOING?";
+                userInput.placeholder = "WHAT ARE WE DOING? (Space works here)";
             };
 
             // Handle Result
@@ -2017,7 +2324,8 @@ CHAT_HTML = """
                         const sensorData = data.sensor_data;
                         document.getElementById('tempValue').textContent = `${sensorData.temperature || '--'} °C`;
                         document.getElementById('humidityValue').textContent = `${sensorData.humidity || '--'} %`;
-                        document.getElementById('lightValue').textContent = sensorData.light || '--';
+                        document.getElementById('lightValue').textContent = sensorData.light || '-- LDR';
+                        document.getElementById('lightInterpretation').textContent = data.light_interpretation || '--';
                     }
                 })
                 .catch(error => {
@@ -2062,7 +2370,7 @@ CHAT_HTML = """
             })
             .then(response => response.json())
             .then(data => {
-                addMessage(`🚨 ${data.message}`, false);
+                addMessage(`⏰ ${data.message}`, false);
             })
             .catch(error => {
                 console.error('Error setting alarm:', error);
@@ -2079,7 +2387,7 @@ CHAT_HTML = """
             })
             .then(response => response.json())
             .then(data => {
-                addMessage("✅ ALARM STOPPED", false);
+                addMessage("🛑 ALARM STOPPED", false);
             })
             .catch(error => {
                 console.error('Error stopping alarm:', error);
@@ -2139,6 +2447,8 @@ if __name__ == '__main__':
     print(f"🔑 LLM2 (Gemini Flash) configured: {'Yes' if GEMINI_API_KEY else 'No'}")
     print(f"🗄  Database connected: {'Yes' if get_db_connection() else 'No'}")
     print(f"📊 Smart Scanning: Enabled with {SCAN_COOLDOWN}-second cooldown")
+    print(f"🔊 ADVANCED ALARM SYSTEM: Ready with time parsing")
+    print(f"💡 LDR Interpretation: Higher values = Darker room")
     print("\n🌐 Available endpoints:")
     print("  GET  http://localhost:5003/ - Super Smart Bros Interface")
     print("  POST http://localhost:5003/chat - Main chat endpoint")
@@ -2150,11 +2460,18 @@ if __name__ == '__main__':
     print("  POST http://localhost:5003/set_oled - Set OLED display text")
     print("\n🎮 Features:")
     print("  • Retro game interface with Dino game")
-    print("  • Live sensor dashboard (Temp, Humidity, Light)")
-    print("  • RGB color controls (Red, Blue, Green, Yellow, Purple, Cyan, White)")
+    print("  • Live sensor dashboard with LDR interpretation")
+    print("  • ADVANCED ALARM PARSING:")
+    print("    - 'Set alarm after 10 minutes'")
+    print("    - 'Wake me up in 2 hours'") 
+    print("    - 'Set alarm for 3:30'")
+    print("    - 'Reminder after 15 mins'")
+    print("  • RGB color controls")
     print("  • Alarm controls for ESP8266 buzzer")
     print("  • OLED display control")
     print("  • Voice input support")
     print("  • Smart scanning with cooldown")
+    print("  • Fixed space bar handling")
+    print("  • Formatted bot messages")
     
     app.run(host='0.0.0.0', port=5003, debug=True)
