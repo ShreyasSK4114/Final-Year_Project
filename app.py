@@ -34,9 +34,8 @@ MYSQL_CONFIG = {
 # Store pending requests and sensor data
 pending_requests = {}
 pending_lock = threading.Lock()
-current_sensor_data = {"temperature": 0, "humidity": 0, "light": 0, "touch": 0}
+current_sensor_data = {"temperature": 0, "humidity": 0, "light": 0}
 esp8266_commands = {}
-current_activity = "Ready"
 
 # Smart scanning control
 last_sensor_scan = 0
@@ -527,57 +526,93 @@ def extract_activity_context(user_message):
     print(f"🔍 ACTIVITY: No specific activity detected, using 'general'")
     return 'general'
 
-def parse_hardware_commands(user_message, llm_response):
-    """Parse hardware commands from user message and LLM response"""
-    print(f"🔧 PARSING HARDWARE COMMANDS: {user_message}")
+# Device Control Functions
+def control_rgb_color(color):
+    """Control RGB LED color"""
+    print(f"🎨 CONTROLLING RGB: Setting color to {color}")
+    esp8266_commands['rgb_color'] = color
+    return f"RGB light set to {color}"
+
+def control_buzzer(duration=None, action=None):
+    """Control buzzer with duration or action"""
+    print(f"🔊 CONTROLLING BUZZER: Duration={duration}, Action={action}")
     
-    commands = {}
-    user_lower = user_message.lower()
-    response_lower = llm_response.lower()
+    if duration:
+        esp8266_commands['buzzer_duration'] = duration
+        esp8266_commands['buzzer_action'] = 'beep'
+        return f"Buzzer set for {duration} seconds"
+    elif action:
+        esp8266_commands['buzzer_action'] = action
+        return f"Buzzer {action}"
+    else:
+        return "No buzzer action specified"
+
+def set_alarm(duration, alarm_type='standard'):
+    """Set alarm with duration and type"""
+    print(f"🚨 SETTING ALARM: Duration={duration}s, Type={alarm_type}")
+    esp8266_commands['alarm'] = True
+    esp8266_commands['alarm_duration'] = duration
+    esp8266_commands['alarm_type'] = alarm_type
+    return f"Alarm set for {duration} seconds ({alarm_type})"
+
+def set_oled_display(text):
+    """Set OLED display text"""
+    print(f"📟 SETTING OLED: {text}")
+    esp8266_commands['oled_text'] = text
+    return f"OLED display set to: {text}"
+
+def parse_device_commands(llm_response, user_message):
+    """Parse device commands from LLM response and user message"""
+    print(f"🔍 PARSING DEVICE COMMANDS from LLM response and user message")
     
-    # Parse alarm commands
-    if any(word in user_lower for word in ['alarm', 'buzzer', 'beep']):
-        if '2 sec' in user_lower or '2 second' in user_lower or 'two sec' in user_lower:
-            commands['alarm'] = True
-            commands['alarm_duration'] = 2
-        elif any(word in user_lower for word in ['alarm', 'buzzer']):
-            commands['alarm'] = True
-            commands['alarm_duration'] = 10  # default
+    commands = []
+    combined_text = f"{user_message} {llm_response}".lower()
     
     # Parse RGB color commands
-    if 'red' in user_lower or 'red' in response_lower:
-        commands['rgb_color'] = 'red'
-    elif 'blue' in user_lower or 'blue' in response_lower:
-        commands['rgb_color'] = 'blue'
-    elif 'green' in user_lower or 'green' in response_lower:
-        commands['rgb_color'] = 'green'
-    elif 'yellow' in user_lower or 'yellow' in response_lower:
-        commands['rgb_color'] = 'yellow'
-    elif 'purple' in user_lower or 'purple' in response_lower:
-        commands['rgb_color'] = 'purple'
-    elif 'white' in user_lower or 'white' in response_lower:
-        commands['rgb_color'] = 'white'
-    elif 'off' in user_lower or 'off' in response_lower:
-        commands['rgb_color'] = 'off'
+    if any(color in combined_text for color in ['red', 'blue', 'green', 'yellow', 'purple', 'cyan', 'white']):
+        if 'red' in combined_text:
+            commands.append(control_rgb_color('red'))
+        elif 'blue' in combined_text:
+            commands.append(control_rgb_color('blue'))
+        elif 'green' in combined_text:
+            commands.append(control_rgb_color('green'))
+        elif 'yellow' in combined_text:
+            commands.append(control_rgb_color('yellow'))
+        elif 'purple' in combined_text or 'violet' in combined_text:
+            commands.append(control_rgb_color('purple'))
+        elif 'cyan' in combined_text:
+            commands.append(control_rgb_color('cyan'))
+        elif 'white' in combined_text:
+            commands.append(control_rgb_color('white'))
     
-    # Parse OLED display activity
-    activity_keywords = {
-        'study': ['study', 'learning', 'homework'],
-        'sleep': ['sleep', 'rest', 'nap'],
-        'work': ['work', 'focus', 'project'],
-        'exercise': ['exercise', 'workout', 'yoga'],
-        'relax': ['relax', 'chill', 'movie', 'tv'],
-        'coding': ['code', 'programming', 'develop']
-    }
+    # Parse buzzer commands
+    if 'buzzer' in combined_text or 'beep' in combined_text:
+        # Extract duration if mentioned
+        duration_match = re.search(r'(\d+)\s*sec', combined_text)
+        duration = int(duration_match.group(1)) if duration_match else 2
+        commands.append(control_buzzer(duration=duration))
     
-    for activity, keywords in activity_keywords.items():
-        if any(keyword in user_lower for keyword in keywords) or any(keyword in response_lower for keyword in keywords):
-            commands['oled_display'] = activity.upper()
-            global current_activity
-            current_activity = activity.upper()
-            break
+    # Parse alarm commands
+    if 'alarm' in combined_text:
+        duration_match = re.search(r'(\d+)\s*sec', combined_text)
+        duration = int(duration_match.group(1)) if duration_match else 10
+        
+        alarm_type = 'standard'
+        if 'urgent' in combined_text or 'emergency' in combined_text:
+            alarm_type = 'urgent'
+        elif 'reminder' in combined_text:
+            alarm_type = 'reminder'
+            
+        commands.append(set_alarm(duration, alarm_type))
     
-    print(f"✅ PARSED HARDWARE COMMANDS: {commands}")
+    # Parse OLED display commands
+    if any(word in combined_text for word in ['display', 'show', 'oled', 'screen']):
+        # Extract the activity context for display
+        activity_context = extract_activity_context(user_message)
+        display_text = f"Activity: {activity_context.upper()}"
+        commands.append(set_oled_display(display_text))
+    
+    print(f"✅ PARSED {len(commands)} device commands")
     return commands
 
 # Flask Routes
@@ -600,6 +635,48 @@ def favicon():
 def chrome_devtools():
     """Handle Chrome DevTools request to prevent 404"""
     return jsonify({}), 200
+
+@app.route('/debug')
+def debug_page():
+    """Debug page to test JavaScript"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Debug Test</title>
+    </head>
+    <body>
+        <h1>Debug Test Page</h1>
+        <input type="text" id="testInput" placeholder="Test message">
+        <button onclick="testSend()">Test Send</button>
+        <div id="result"></div>
+        
+        <script>
+            async function testSend() {
+                const message = document.getElementById('testInput').value;
+                console.log('Sending:', message);
+                
+                try {
+                    const response = await fetch('/chat', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            user_activity: message,
+                            session_id: 'debug_test'
+                        })
+                    });
+                    const data = await response.json();
+                    document.getElementById('result').innerHTML = 'Response: ' + JSON.stringify(data);
+                    console.log('Success:', data);
+                } catch (error) {
+                    document.getElementById('result').innerHTML = 'Error: ' + error;
+                    console.error('Error:', error);
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
 
 @app.route('/chat', methods=['POST'])
 def handle_chat():
@@ -715,15 +792,14 @@ def handle_info_request(user_message, session_id, classification):
                 "please ask again or check the conversation history."
             )
 
-        # Step 4: Parse hardware commands from user message and response
-        print("🔧 STEP 4: Parsing hardware commands")
-        hardware_commands = parse_hardware_commands(user_message, llm_response)
+        # Step 4: Parse and execute device commands
+        print("🎮 STEP 4: Parsing device commands")
+        device_commands = parse_device_commands(llm_response, user_message)
         
-        # Apply hardware commands
-        if hardware_commands:
-            global esp8266_commands
-            esp8266_commands.update(hardware_commands)
-            print(f"✅ HARDWARE COMMANDS APPLIED: {hardware_commands}")
+        # Combine LLM response with device commands
+        final_response = llm_response
+        if device_commands:
+            final_response += "\n\n" + "🔧 Device Actions:\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
 
         # Step 5: Store assistant response in DB
         print("💾 STEP 5: Storing assistant response in database")
@@ -731,12 +807,8 @@ def handle_info_request(user_message, session_id, classification):
             store_conversation(
                 session_id,
                 'assistant',
-                llm_response,
-                metadata={
-                    "type": "info_response", 
-                    "classification": classification,
-                    "hardware_commands": hardware_commands
-                }
+                final_response,
+                metadata={"type": "info_response", "classification": classification, "device_commands": device_commands}
             )
         except Exception as e:
             print(f"❌ STORAGE ERROR: Failed to store assistant response: {e}")
@@ -746,10 +818,10 @@ def handle_info_request(user_message, session_id, classification):
         # Step 6: Return structured JSON for the HTTP response
         return jsonify({
             "status": "completed",
-            "response": llm_response,
+            "response": final_response,
             "needs_sensor_data": False,
             "message_type": classification.get('message_type', 'past_data_query'),
-            "hardware_commands": hardware_commands
+            "device_commands": device_commands
         })
 
     except Exception as e:
@@ -813,16 +885,15 @@ Provide your response in a helpful, conversational tone with specific recommenda
             print("🧠 Generating optimization response with LLM1")
             llm_response = get_llm1_response(optimization_prompt)
             
-            # Parse hardware commands
-            print("🔧 Parsing hardware commands from optimization")
-            hardware_commands = parse_hardware_commands(request_info["user_message"], llm_response)
+            # Parse and execute device commands
+            print("🎮 Parsing device commands for action request")
+            device_commands = parse_device_commands(llm_response, request_info["user_message"])
             
-            # Apply hardware commands
-            if hardware_commands:
-                global esp8266_commands
-                esp8266_commands.update(hardware_commands)
-                print(f"✅ HARDWARE COMMANDS APPLIED: {hardware_commands}")
-
+            # Combine LLM response with device commands
+            final_response = llm_response
+            if device_commands:
+                final_response += "\n\n" + "🔧 Device Actions:\n" + "\n".join([f"• {cmd}" for cmd in device_commands])
+            
             # Parse and store environment changes
             print("💾 Storing environment changes")
             environment_changes = parse_environment_changes(llm_response, sensor_data, activity_context)
@@ -841,15 +912,12 @@ Provide your response in a helpful, conversational tone with specific recommenda
             store_conversation(
                 request_info["session_id"],
                 'assistant',
-                llm_response,
-                metadata={
-                    "type": "optimization_response",
-                    "hardware_commands": hardware_commands
-                },
+                final_response,
+                metadata={"device_commands": device_commands},
                 request_id=request_id
             )
             
-            request_info["result"] = llm_response
+            request_info["result"] = final_response
             request_info["status"] = "completed"
             request_info["completed_at"] = datetime.now().isoformat()
         
@@ -861,8 +929,8 @@ Provide your response in a helpful, conversational tone with specific recommenda
         return jsonify({
             "status": "completed",
             "request_id": request_id,
-            "response": llm_response,
-            "hardware_commands": hardware_commands,
+            "response": final_response,
+            "device_commands": device_commands,
             "message": "Scan completed successfully"
         })
         
@@ -932,7 +1000,141 @@ def check_status(request_id):
                 "user_message": request_info["user_message"]
             })
 
-# Hardware Control Endpoints
+@app.route('/conversation_history/<session_id>', methods=['GET'])
+def get_conversation_history(session_id):
+    """Get complete conversation history for a session"""
+    print(f"📜 CONVERSATION HISTORY: Retrieving history for session {session_id}")
+    
+    try:
+        connection = get_db_connection()
+        if connection:
+            cursor = connection.cursor(dictionary=True)
+            
+            cursor.execute(
+                """SELECT message_type, content, metadata, sensor_data, request_id, created_at 
+                FROM conversations 
+                WHERE session_id = %s 
+                ORDER BY created_at ASC""",
+                (session_id,)
+            )
+            
+            conversations = cursor.fetchall()
+            cursor.close()
+            connection.close()
+            
+            print(f"✅ CONVERSATION HISTORY: Retrieved {len(conversations)} messages")
+            return jsonify({
+                "session_id": session_id,
+                "conversations": conversations,
+                "status": "success"
+            })
+        else:
+            print("❌ CONVERSATION HISTORY: Database connection failed")
+            return jsonify({"error": "Database connection failed", "status": "error"}), 500
+            
+    except Exception as e:
+        print(f"❌ CONVERSATION HISTORY ERROR: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+@app.route('/environment_history/<session_id>', methods=['GET'])
+def get_environment_history_endpoint(session_id):
+    """Get environment change history for a session"""
+    print(f"🌡  ENVIRONMENT HISTORY: Retrieving changes for session {session_id}")
+    
+    try:
+        connection = get_db_connection()
+        if connection:
+            cursor = connection.cursor(dictionary=True)
+            
+            cursor.execute(
+                """SELECT factor, previous_value, new_value, reasoning, activity_context, created_at 
+                FROM environment_changes 
+                WHERE session_id = %s 
+                ORDER BY created_at DESC""",
+                (session_id,)
+            )
+            
+            changes = cursor.fetchall()
+            cursor.close()
+            connection.close()
+            
+            print(f"✅ ENVIRONMENT HISTORY: Retrieved {len(changes)} changes")
+            return jsonify({
+                "session_id": session_id,
+                "environment_changes": changes,
+                "status": "success"
+            })
+        else:
+            print("❌ ENVIRONMENT HISTORY: Database connection failed")
+            return jsonify({"error": "Database connection failed", "status": "error"}), 500
+            
+    except Exception as e:
+        print(f"❌ ENVIRONMENT HISTORY ERROR: {e}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+# Device Command Endpoints
+@app.route('/get_commands/esp32')
+def get_commands_esp32():
+    """Get commands for ESP32 (OLED display)"""
+    commands = {}
+    if 'oled_text' in esp8266_commands:
+        commands['oled_text'] = esp8266_commands['oled_text']
+    print(f"📡 Sending commands to ESP32: {commands}")
+    return jsonify(commands)
+
+@app.route('/get_commands/esp8266')
+def get_commands_esp8266():
+    """Get commands for ESP8266 (RGB + Buzzer)"""
+    commands = {}
+    
+    # RGB commands
+    if 'rgb_color' in esp8266_commands:
+        commands['rgb_color'] = esp8266_commands['rgb_color']
+    
+    # Buzzer commands
+    if 'buzzer_action' in esp8266_commands:
+        commands['buzzer_action'] = esp8266_commands['buzzer_action']
+    
+    if 'buzzer_duration' in esp8266_commands:
+        commands['buzzer_duration'] = esp8266_commands['buzzer_duration']
+    
+    # Alarm commands
+    if 'alarm' in esp8266_commands:
+        commands['alarm'] = esp8266_commands['alarm']
+        if 'alarm_duration' in esp8266_commands:
+            commands['alarm_duration'] = esp8266_commands['alarm_duration']
+        if 'alarm_type' in esp8266_commands:
+            commands['alarm_type'] = esp8266_commands['alarm_type']
+    
+    print(f"📡 Sending commands to ESP8266: {commands}")
+    return jsonify(commands)
+
+@app.route('/clear_commands/esp8266', methods=['POST'])
+def clear_esp8266_commands():
+    """Clear ESP8266 commands after they've been read"""
+    global esp8266_commands
+    
+    # Only clear buzzer and RGB commands, keep OLED for ESP32
+    keys_to_clear = ['rgb_color', 'buzzer_action', 'buzzer_duration', 'alarm', 'alarm_duration', 'alarm_type']
+    for key in keys_to_clear:
+        if key in esp8266_commands:
+            del esp8266_commands[key]
+    
+    print("✅ ESP8266 commands cleared")
+    return jsonify({"status": "success", "message": "ESP8266 commands cleared"})
+
+@app.route('/clear_commands/esp32', methods=['POST'])
+def clear_esp32_commands():
+    """Clear ESP32 commands after they've been read"""
+    global esp8266_commands
+    
+    if 'oled_text' in esp8266_commands:
+        del esp8266_commands['oled_text']
+    
+    print("✅ ESP32 commands cleared")
+    return jsonify({"status": "success", "message": "ESP32 commands cleared"})
+
+# Smart Scanning Endpoints
 @app.route('/sensor_data', methods=['POST'])
 def receive_sensor_data():
     """Receive sensor data from ESP32"""
@@ -958,50 +1160,38 @@ def get_pending_request():
     
     return jsonify({"request_id": ""})
 
-@app.route('/get_commands/esp8266')
-def get_commands_esp8266():
-    """Get commands for ESP8266 (RGB + Buzzer + OLED)"""
-    commands = esp8266_commands.copy()
-    # Add current activity to OLED display
-    if 'oled_display' not in commands:
-        commands['oled_display'] = current_activity
-    esp8266_commands.clear()
-    return jsonify(commands)
-
 @app.route('/control_rgb', methods=['POST'])
 def control_rgb():
     """Control RGB from web interface"""
     color = request.form.get('color')
-    esp8266_commands['rgb_color'] = color
-    return jsonify({"status": "success", "color": color})
+    result = control_rgb_color(color)
+    return jsonify({"status": "success", "message": result})
 
 @app.route('/control_buzzer', methods=['POST'])
-def control_buzzer():
+def control_buzzer_web():
     """Control buzzer from web interface"""
     action = request.form.get('action')
-    esp8266_commands['buzzer_action'] = action
+    duration = request.form.get('duration')
     
-    # Special handling for alarm
-    if action == "alarm":
-        esp8266_commands['alarm'] = True
+    if duration:
+        result = control_buzzer(duration=int(duration))
+    else:
+        result = control_buzzer(action=action)
     
-    return jsonify({"status": "success", "action": action})
+    return jsonify({"status": "success", "message": result})
 
 @app.route('/set_alarm', methods=['POST'])
-def set_alarm():
+def set_alarm_endpoint():
     """Set alarm with duration and type"""
     data = request.get_json()
     duration = data.get('duration', 10)  # seconds
     alarm_type = data.get('type', 'standard')  # standard, urgent, reminder
     
-    esp8266_commands['alarm'] = True
-    esp8266_commands['alarm_duration'] = duration
-    esp8266_commands['alarm_type'] = alarm_type
+    result = set_alarm(duration, alarm_type)
     
     return jsonify({
         "status": "success", 
-        "message": f"Alarm set for {duration} seconds",
-        "type": alarm_type
+        "message": result
     })
 
 @app.route('/stop_alarm', methods=['POST'])
@@ -1016,17 +1206,10 @@ def stop_alarm():
 def set_oled():
     """Set OLED display text"""
     data = request.get_json()
-    text = data.get('text', 'Ready')
-    global current_activity
-    current_activity = text
+    text = data.get('text', 'Hello World')
     
-    esp8266_commands['oled_display'] = text
-    
-    return jsonify({
-        "status": "success", 
-        "message": f"OLED set to: {text}",
-        "display_text": text
-    })
+    result = set_oled_display(text)
+    return jsonify({"status": "success", "message": result})
 
 @app.route('/current_sensor_data', methods=['GET'])
 def get_current_sensor_data():
@@ -1034,16 +1217,7 @@ def get_current_sensor_data():
     return jsonify({
         "status": "success",
         "sensor_data": current_sensor_data,
-        "current_activity": current_activity,
         "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/current_activity', methods=['GET'])
-def get_current_activity():
-    """Get current activity for OLED"""
-    return jsonify({
-        "status": "success",
-        "current_activity": current_activity
     })
 
 @app.route('/force_scan', methods=['POST'])
@@ -1081,7 +1255,6 @@ def health_check():
         "llm2_configured": bool(GEMINI_API_KEY),
         "scan_cooldown": SCAN_COOLDOWN,
         "can_scan_now": can_scan_now(),
-        "current_activity": current_activity,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -1432,8 +1605,8 @@ CHAT_HTML = """
             color: #ccc;
         }
 
-        /* --- ACTIVITY DISPLAY --- */
-        .activity-display {
+        /* --- RGB COLOR CONTROLS --- */
+        .color-controls {
             background: #000;
             border: 4px solid #ff00ff;
             padding: 15px;
@@ -1441,17 +1614,32 @@ CHAT_HTML = """
             text-align: center;
         }
 
-        .activity-display h3 {
+        .color-controls h3 {
             color: #ff00ff;
             margin-bottom: 10px;
             font-size: 12px;
         }
 
-        .current-activity {
-            font-size: 14px;
-            color: #ffff00;
-            margin: 10px 0;
+        .color-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
         }
+
+        .color-btn {
+            padding: 10px 15px;
+            font-size: 9px;
+            min-width: 80px;
+        }
+
+        .color-red { background: #e70012; }
+        .color-blue { background: #0088aa; }
+        .color-green { background: #00aa00; }
+        .color-yellow { background: #ffff00; color: #000; }
+        .color-purple { background: #aa00aa; }
+        .color-cyan { background: #00aaaa; }
+        .color-white { background: #ffffff; color: #000; }
     </style>
 </head>
 <body>
@@ -1497,17 +1685,21 @@ CHAT_HTML = """
                         <div class="sensor-label">LIGHT LEVEL</div>
                         <div class="sensor-value" id="lightValue">--</div>
                     </div>
-                    <div class="sensor-item">
-                        <div class="sensor-label">TOUCH</div>
-                        <div class="sensor-value" id="touchValue">--</div>
-                    </div>
                 </div>
             </div>
 
-            <!-- ACTIVITY DISPLAY -->
-            <div class="activity-display">
-                <h3>📱 CURRENT ACTIVITY</h3>
-                <div class="current-activity" id="currentActivity">READY</div>
+            <!-- RGB COLOR CONTROLS -->
+            <div class="color-controls">
+                <h3>🎨 RGB COLOR CONTROLS</h3>
+                <div class="color-buttons">
+                    <button class="color-btn color-red" onclick="setRGBColor('red')">RED</button>
+                    <button class="color-btn color-blue" onclick="setRGBColor('blue')">BLUE</button>
+                    <button class="color-btn color-green" onclick="setRGBColor('green')">GREEN</button>
+                    <button class="color-btn color-yellow" onclick="setRGBColor('yellow')">YELLOW</button>
+                    <button class="color-btn color-purple" onclick="setRGBColor('purple')">PURPLE</button>
+                    <button class="color-btn color-cyan" onclick="setRGBColor('cyan')">CYAN</button>
+                    <button class="color-btn color-white" onclick="setRGBColor('white')">WHITE</button>
+                </div>
             </div>
 
             <!-- ALARM CONTROLS -->
@@ -1534,8 +1726,6 @@ CHAT_HTML = """
                     </div>
                     <br>
                     <div class="sensor-info">SENSORS: ONLINE [OK]</div>
-                    <br>
-                    <div class="sensor-info">💡 Try: "set alarm for 2 seconds", "turn light to red", "I'm studying now"</div>
                 </div>
             </div>
 
@@ -1654,7 +1844,7 @@ CHAT_HTML = """
             if(["Space", "ArrowUp", "ArrowDown"].indexOf(e.code) > -1) {
                 e.preventDefault();
             }
-            if ((e.key === "ArrowUp" || e.code === "Space")) {
+            if ((e.key === " " || e.code === "Space" || e.key === "ArrowUp")) {
                 if (isGameOver) resetGame();
                 else jump();
             }
@@ -1672,7 +1862,7 @@ CHAT_HTML = """
         startScore();
 
         // --- CHAT LOGIC ---
-        // FIXED SPRITES
+        // FIXED SPRITES (No randomization)
         const HERO_SPRITE = "https://i.ibb.co/9jSstgJ/mari.jpg";
         const BOT_SPRITE = "https://i.ibb.co/Sw5Z1cRf/bot.jpg";
 
@@ -1719,10 +1909,6 @@ CHAT_HTML = """
                 .then(data => {
                     if (data.status === 'completed') {
                         addMessage(data.response, false);
-                        // Update activity display if hardware commands were executed
-                        if (data.hardware_commands && data.hardware_commands.oled_display) {
-                            document.getElementById('currentActivity').textContent = data.hardware_commands.oled_display;
-                        }
                     } else if (data.status === 'waiting_for_sensors') {
                         addMessage("🔄 SCANNING SENSORS...", false);
                         // Poll for completion
@@ -1758,7 +1944,7 @@ CHAT_HTML = """
             }, 2000);
         }
 
-        // Event listeners for send button and enter key - FIXED
+        // Event listeners for send button and enter key
         document.getElementById('sendButton').addEventListener('click', sendMessage);
         
         document.getElementById('userInput').addEventListener('keydown', function(e) {
@@ -1769,7 +1955,7 @@ CHAT_HTML = """
             // Shift+Enter will create a new line
         });
 
-        // --- VOICE INPUT LOGIC ---
+        // --- VOICE INPUT LOGIC (NEW) ---
         const voiceButton = document.getElementById('voiceButton');
         const userInput = document.getElementById('userInput');
         
@@ -1832,8 +2018,6 @@ CHAT_HTML = """
                         document.getElementById('tempValue').textContent = `${sensorData.temperature || '--'} °C`;
                         document.getElementById('humidityValue').textContent = `${sensorData.humidity || '--'} %`;
                         document.getElementById('lightValue').textContent = sensorData.light || '--';
-                        document.getElementById('touchValue').textContent = sensorData.touch || '--';
-                        document.getElementById('currentActivity').textContent = data.current_activity || 'READY';
                     }
                 })
                 .catch(error => {
@@ -1844,6 +2028,25 @@ CHAT_HTML = """
         // Update sensor data every 3 seconds
         setInterval(updateSensorDashboard, 3000);
         updateSensorDashboard(); // Initial update
+
+        // --- RGB COLOR CONTROL ---
+        function setRGBColor(color) {
+            fetch('/control_rgb', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: `color=${color}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                addMessage(`🎨 ${data.message}`, false);
+            })
+            .catch(error => {
+                console.error('Error setting RGB color:', error);
+                addMessage("❌ ERROR: Could not set RGB color", false);
+            });
+        }
 
         // --- ALARM FUNCTIONS ---
         function setAlarm(duration, type) {
@@ -1859,7 +2062,7 @@ CHAT_HTML = """
             })
             .then(response => response.json())
             .then(data => {
-                addMessage(`🚨 ALARM SET: ${data.message} (${type})`, false);
+                addMessage(`🚨 ${data.message}`, false);
             })
             .catch(error => {
                 console.error('Error setting alarm:', error);
@@ -1902,22 +2105,26 @@ CHAT_HTML = """
             });
         }
 
-        // Update activity display
-        function updateActivity() {
-            fetch('/current_activity')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        document.getElementById('currentActivity').textContent = data.current_activity;
-                    }
+        // --- OLED DISPLAY CONTROL ---
+        function setOLEDDisplay(text) {
+            fetch('/set_oled', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    text: text
                 })
-                .catch(error => {
-                    console.error('Error updating activity:', error);
-                });
+            })
+            .then(response => response.json())
+            .then(data => {
+                addMessage(`📟 ${data.message}`, false);
+            })
+            .catch(error => {
+                console.error('Error setting OLED display:', error);
+                addMessage("❌ ERROR: Could not set OLED display", false);
+            });
         }
-
-        // Update activity every 5 seconds
-        setInterval(updateActivity, 5000);
     </script>
 </body>
 </html>
@@ -1939,20 +2146,15 @@ if __name__ == '__main__':
     print("  GET  http://localhost:5003/current_sensor_data - Get current sensor data for dashboard")
     print("  POST http://localhost:5003/set_alarm - Set alarm on ESP8266")
     print("  POST http://localhost:5003/stop_alarm - Stop alarm")
+    print("  POST http://localhost:5003/control_rgb - Control RGB LED color")
     print("  POST http://localhost:5003/set_oled - Set OLED display text")
     print("\n🎮 Features:")
     print("  • Retro game interface with Dino game")
-    print("  • Live sensor dashboard (Temp, Humidity, Light, Touch)")
+    print("  • Live sensor dashboard (Temp, Humidity, Light)")
+    print("  • RGB color controls (Red, Blue, Green, Yellow, Purple, Cyan, White)")
     print("  • Alarm controls for ESP8266 buzzer")
-    print("  • RGB LED control (red, blue, green, yellow, purple, white, off)")
-    print("  • OLED display for current activity")
+    print("  • OLED display control")
     print("  • Voice input support")
     print("  • Smart scanning with cooldown")
-    print("\n💬 Try these commands:")
-    print("  • 'set alarm for 2 seconds'")
-    print("  • 'turn light to red'")
-    print("  • 'I'm studying now' (shows on OLED)")
-    print("  • 'buzzer for 5 seconds'")
-    print("  • 'change RGB to blue'")
     
     app.run(host='0.0.0.0', port=5003, debug=True)

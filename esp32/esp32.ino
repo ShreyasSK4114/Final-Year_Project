@@ -9,7 +9,6 @@
 // Sensor pins
 #define DHT_PIN 4
 #define LDR_PIN 34
-#define TOUCH_PIN 27
 
 // OLED settings
 #define SCREEN_WIDTH 128
@@ -23,7 +22,7 @@
 const char* ssid = "Sunil BSNL";
 const char* password = "9844007710";
 
-// Server details - Updated port to 5003
+// Server details
 const char* serverURL = "http://192.168.1.38:5003";
 
 // Initialize components
@@ -36,15 +35,18 @@ struct SensorData {
   float temperature;
   float humidity;
   int light;
-  int touch;
 };
 
 String currentSuggestion = "Ready for AI commands";
 String currentActivity = "No active task";
+String oledDisplayText = "Smart Environment"; // Default OLED text
 unsigned long lastSuggestionUpdate = 0;
 const unsigned long SUGGESTION_INTERVAL = 30000;
-int lastTouchState = 0;
 String pendingRequestId = "";
+
+// Command polling
+unsigned long lastCommandCheck = 0;
+const unsigned long COMMAND_CHECK_INTERVAL = 2000; // Check every 2 seconds
 
 void setup() {
   Serial.begin(115200);
@@ -52,7 +54,6 @@ void setup() {
   // Initialize sensors
   dht.begin();
   pinMode(LDR_PIN, INPUT);
-  pinMode(TOUCH_PIN, INPUT);
   
   // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -68,6 +69,9 @@ void setup() {
   connectToWiFi();
   
   Serial.println("Smart Environment System Started");
+  
+  // Set initial OLED display
+  updateOLEDDisplay("System Ready", "Waiting for AI...");
 }
 
 void connectToWiFi() {
@@ -113,19 +117,14 @@ void loop() {
   SensorData data = readSensors();
   sendSensorData(data);
   
-  // Check for touch and send status
-  int currentTouchState = digitalRead(TOUCH_PIN);
-  if (currentTouchState != lastTouchState) {
-    sendTouchStatus(currentTouchState);
-    lastTouchState = currentTouchState;
-    
-    if (currentTouchState == 1) {
-      Serial.println("🎯 Touch detected! Desktop app should open...");
-    }
-  }
-  
   // Check for pending requests that need sensor data
   checkForPendingRequests(data);
+  
+  // Check for new commands from server (OLED display)
+  if (millis() - lastCommandCheck > COMMAND_CHECK_INTERVAL) {
+    checkForCommands();
+    lastCommandCheck = millis();
+  }
   
   // Get new AI suggestion every 30 seconds
   if (millis() - lastSuggestionUpdate > SUGGESTION_INTERVAL) {
@@ -133,8 +132,8 @@ void loop() {
     lastSuggestionUpdate = millis();
   }
   
-  updateOLED(data, currentTouchState);
-  delay(5000);
+  updateOLED(data);
+  delay(2000);
 }
 
 SensorData readSensors() {
@@ -142,7 +141,6 @@ SensorData readSensors() {
   data.temperature = dht.readTemperature();
   data.humidity = dht.readHumidity();
   data.light = analogRead(LDR_PIN);  // LDR sensor reading
-  data.touch = digitalRead(TOUCH_PIN);
   
   if (isnan(data.temperature) || isnan(data.humidity)) {
     data.temperature = 0;
@@ -161,7 +159,6 @@ void sendSensorData(SensorData data) {
     doc["temperature"] = data.temperature;
     doc["humidity"] = data.humidity;
     doc["light"] = data.light;  // LDR value
-    doc["touch"] = data.touch;
     
     String jsonStr;
     serializeJson(doc, jsonStr);
@@ -216,7 +213,6 @@ void provideSensorDataForRequest(String requestId, SensorData data) {
     doc["sensor_data"]["temperature"] = data.temperature;
     doc["sensor_data"]["humidity"] = data.humidity;
     doc["sensor_data"]["light"] = data.light;
-    doc["sensor_data"]["touch"] = data.touch;
     
     String jsonStr;
     serializeJson(doc, jsonStr);
@@ -230,7 +226,7 @@ void provideSensorDataForRequest(String requestId, SensorData data) {
       Serial.println("✅ Sensor data provided for request: " + requestId);
       String response = http.getString();
       
-      // Parse the response to get AI suggestions
+      // Parse the response to get AI suggestions and commands
       DynamicJsonDocument respDoc(1024);
       DeserializationError error = deserializeJson(respDoc, response);
       
@@ -241,6 +237,9 @@ void provideSensorDataForRequest(String requestId, SensorData data) {
           currentActivity = extractActivity(aiResponse);
           Serial.println("AI Activity: " + currentActivity);
           Serial.println("AI Suggestion: " + currentSuggestion);
+          
+          // Update OLED with activity
+          oledDisplayText = "Activity: " + currentActivity;
         }
       }
     } else {
@@ -251,23 +250,51 @@ void provideSensorDataForRequest(String requestId, SensorData data) {
   }
 }
 
-void sendTouchStatus(int touchState) {
+void checkForCommands() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     
-    StaticJsonDocument<100> doc;
-    doc["touch"] = touchState;
+    String fullURL = String(serverURL) + "/get_commands/esp32";
+    http.begin(client, fullURL);
+    int httpCode = http.GET();
     
-    String jsonStr;
-    serializeJson(doc, jsonStr);
+    if (httpCode == 200) {
+      String response = http.getString();
+      DynamicJsonDocument doc(1024);
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error) {
+        // Check for OLED display command
+        if (doc.containsKey("oled_text")) {
+          String newOledText = doc["oled_text"].as<String>();
+          if (newOledText != oledDisplayText) {
+            oledDisplayText = newOledText;
+            Serial.println("📟 New OLED Text: " + oledDisplayText);
+            // Update OLED immediately with just the text
+            updateOLEDDisplay("AI Command:", oledDisplayText);
+            
+            // Clear the command after processing
+            clearCommandsOnServer();
+          }
+        }
+      }
+    }
     
-    String fullURL = String(serverURL) + "/update_touch";
+    http.end();
+  }
+}
+
+void clearCommandsOnServer() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    String fullURL = String(serverURL) + "/clear_commands/esp32";
     http.begin(client, fullURL);
     http.addHeader("Content-Type", "application/json");
-    http.POST(jsonStr);
+    http.POST("{}");
     http.end();
     
-    Serial.println("Touch status sent: " + String(touchState));
+    Serial.println("✅ ESP32 commands cleared on server");
   }
 }
 
@@ -346,21 +373,25 @@ String extractActivity(String fullResponse) {
   return "General Activity";
 }
 
-void updateOLED(SensorData data, int touchState) {
+void updateOLED(SensorData data) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
   
-  // Display current activity
-  display.println("ACTIVITY: " + currentActivity);
+  // Display current activity or command
+  if (oledDisplayText.length() > 0) {
+    display.println(oledDisplayText);
+  } else {
+    display.println("ACTIVITY: " + currentActivity);
+  }
+  
   display.println("---------------");
   
   // Display sensor data
   display.print("Temp: "); display.print(data.temperature); display.println(" C");
   display.print("Hum:  "); display.print(data.humidity); display.println(" %");
   display.print("LDR:  "); display.println(data.light);
-  display.print("Touch: "); display.println(touchState ? "YES" : "NO");
   display.println("---------------");
   
   // Display AI suggestion
@@ -377,6 +408,32 @@ void updateOLED(SensorData data, int touchState) {
   }
   
   display.display();
+}
+
+void updateOLEDDisplay(String title, String message) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  
+  // Display title
+  display.println(title);
+  display.println("---------------");
+  
+  // Display message with word wrap
+  String lines[4];
+  splitString(message, lines, 4, 20);
+  
+  for (int i = 0; i < 4; i++) {
+    if (lines[i].length() > 0) {
+      display.println(lines[i]);
+    }
+  }
+  
+  display.display();
+  
+  // Keep this display for 5 seconds then return to normal
+  delay(5000);
 }
 
 void splitString(String input, String output[], int maxLines, int maxChars) {
