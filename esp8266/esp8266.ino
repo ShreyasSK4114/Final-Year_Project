@@ -4,11 +4,11 @@
 #include <ArduinoJson.h>
 
 // WiFi credentials
-const char* ssid = "WiFi_SSID";
-const char* password = "WiFi_Password";
+const char* ssid = "Sunil BSNL";
+const char* password = "9844007710";
 
-// Server details
-const char* serverURL = "Server_IP_Address"; // e.g., "http://
+// Server details - Updated port to 5003
+const char* serverURL = "http://192.168.1.38:5003";
 
 // RGB LED pins
 #define RED_PIN 12    // GPIO12
@@ -20,6 +20,11 @@ const char* serverURL = "Server_IP_Address"; // e.g., "http://
 
 WiFiClient client;
 HTTPClient http;
+
+// Buzzer states
+bool isAlarmActive = false;
+unsigned long alarmStartTime = 0;
+const unsigned long ALARM_DURATION = 10000; // 10 seconds alarm
 
 void setup() {
   Serial.begin(115200);
@@ -70,14 +75,16 @@ void loop() {
     connectToWiFi();
   }
   
+  // Handle active alarm
+  if (isAlarmActive) {
+    handleAlarm();
+  }
+  
   delay(2000);
 }
 
 void checkCommands() {
-  // FIX: Use WiFiClient with HTTPClient
   String fullURL = String(serverURL) + "/get_commands/esp8266";
-  
-  // Updated HTTPClient usage
   http.begin(client, fullURL);
   
   int httpCode = http.GET();
@@ -101,6 +108,15 @@ void checkCommands() {
         if (doc.containsKey("buzzer_action")) {
           String action = doc["buzzer_action"];
           handleBuzzer(action);
+        }
+        
+        if (doc.containsKey("alarm")) {
+          bool alarm = doc["alarm"];
+          if (alarm && !isAlarmActive) {
+            startAlarm();
+          } else if (!alarm && isAlarmActive) {
+            stopAlarm();
+          }
         }
       } else {
         Serial.println("JSON parsing error");
@@ -162,16 +178,54 @@ void handleBuzzer(String action) {
       delay(100);
     }
   } else if (action == "alarm") {
-    for(int i = 0; i < 5; i++) {
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(500);
-      digitalWrite(BUZZER_PIN, LOW);
-      delay(500);
-    }
+    startAlarm();
   } else if (action == "off") {
+    stopAlarm();
     digitalWrite(BUZZER_PIN, LOW);
   } else {
     Serial.println("Unknown buzzer action: " + action);
     digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void startAlarm() {
+  Serial.println("🚨 ALARM STARTED!");
+  isAlarmActive = true;
+  alarmStartTime = millis();
+  
+  // Flash red light with alarm
+  digitalWrite(RED_PIN, HIGH);
+  digitalWrite(GREEN_PIN, LOW);
+  digitalWrite(BLUE_PIN, LOW);
+}
+
+void stopAlarm() {
+  Serial.println("🔇 ALARM STOPPED!");
+  isAlarmActive = false;
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_PIN, LOW);
+}
+
+void handleAlarm() {
+  if (millis() - alarmStartTime > ALARM_DURATION) {
+    stopAlarm();
+    return;
+  }
+  
+  // Create pulsating alarm sound
+  unsigned long currentTime = millis();
+  int cycle = (currentTime - alarmStartTime) % 1000;
+  
+  if (cycle < 500) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  
+  // Flash red light
+  if (cycle % 200 < 100) {
+    digitalWrite(RED_PIN, HIGH);
+  } else {
+    digitalWrite(RED_PIN, LOW);
   }
 }
